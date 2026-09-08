@@ -1,0 +1,246 @@
+// Nebula Supermarket Ops Agent — Database Schema
+// PostgreSQL with Prisma ORM
+// All monetary values stored as integers (paise) to avoid floating-point issues
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Products & Inventory ───────────────────────────────────────────
+
+model Product {
+  id          String   @id @default(uuid())
+  sku         String   @unique
+  name        String
+  unit        Unit
+  unitType    UnitType
+  costPrice   Int      // in paise (₹12.00 = 1200)
+  sellPrice   Int      // in paise
+  mrp         Int      // in paise
+  quantity    Decimal  @db.Decimal(12, 3) // supports loose items (2.5 kg)
+  reorderLevel Decimal @db.Decimal(12, 3) @default(0)
+  gstRate     Decimal  @db.Decimal(5, 2) // e.g. 5.00, 12.00, 18.00
+  hsnCode     String
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  billItems        BillItem[]
+  inventoryHistory InventoryHistory[]
+
+  @@index([name])
+  @@index([sku])
+}
+
+enum Unit {
+  KG
+  G
+  LITRE
+  ML
+  PACKET
+  DOZEN
+  PIECE
+}
+
+enum UnitType {
+  LOOSE
+  PACKAGED
+}
+
+model InventoryHistory {
+  id         String              @id @default(uuid())
+  productId  String
+  product    Product             @relation(fields: [productId], references: [id])
+  changeType InventoryChangeType
+  quantity   Decimal             @db.Decimal(12, 3)
+  reference  String?             // bill ID, stock-in note, etc.
+  notes      String?
+  createdAt  DateTime            @default(now())
+
+  @@index([productId])
+  @@index([createdAt])
+}
+
+enum InventoryChangeType {
+  STOCK_IN
+  SALE
+  ADJUSTMENT
+  RETURN
+}
+
+// ─── Bills & Billing ────────────────────────────────────────────────
+
+model Bill {
+  id              String      @id @default(uuid())
+  billNumber      String?     @unique // Sequential bill number, set on finalization
+  status          BillStatus  @default(DRAFT)
+  telegramUserId  String
+  paymentMethod   PaymentMethod?
+  paymentRef      String?     // UPI ref, card ref, etc.
+
+  // Totals (in paise), computed on finalization
+  subtotal        Int         @default(0)
+  totalCgst       Int         @default(0)
+  totalSgst       Int         @default(0)
+  totalTax        Int         @default(0)
+  grandTotal      Int         @default(0)
+
+  // Idempotency
+  idempotencyKey  String?     @unique
+
+  // Customer (optional, for khata)
+  customerId      String?
+  customer        Customer?   @relation(fields: [customerId], references: [id])
+
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  finalizedAt     DateTime?
+
+  items           BillItem[]
+  khataEntries    KhataEntry[]
+
+  @@index([telegramUserId])
+  @@index([status])
+  @@index([finalizedAt])
+}
+
+enum BillStatus {
+  DRAFT
+  FINALIZED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  UPI
+  CARD
+  CREDIT  // Khata / on credit
+}
+
+model BillItem {
+  id           String  @id @default(uuid())
+  billId       String
+  bill         Bill    @relation(fields: [billId], references: [id], onDelete: Cascade)
+  productId    String
+  product      Product @relation(fields: [productId], references: [id])
+  productName  String  // Snapshot at time of billing
+  quantity     Decimal @db.Decimal(12, 3)
+  unitPrice    Int     // in paise — sell price at time of billing
+  costPrice    Int     // in paise — for below-cost guard
+  taxableValue Int     // in paise — quantity * unitPrice
+  gstRate      Decimal @db.Decimal(5, 2)
+  hsnCode      String
+  cgst         Int     // in paise
+  sgst         Int     // in paise
+  lineTotal    Int     // in paise — taxableValue + cgst + sgst
+
+  createdAt    DateTime @default(now())
+
+  @@index([billId])
+}
+
+// ─── Customers & Khata ──────────────────────────────────────────────
+
+model Customer {
+  id             String   @id @default(uuid())
+  name           String
+  phone          String?
+  telegramUserId String   // Owner who manages this customer
+  balance        Int      @default(0) // in paise, positive = customer owes
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  bills          Bill[]
+  khataEntries   KhataEntry[]
+
+  @@unique([name, telegramUserId])
+  @@index([telegramUserId])
+  @@index([name])
+}
+
+model KhataEntry {
+  id          String       @id @default(uuid())
+  customerId  String
+  customer    Customer     @relation(fields: [customerId], references: [id])
+  type        KhataType
+  amount      Int          // in paise, always positive
+  balance     Int          // running balance after this entry, in paise
+  reference   String?      // bill ID, payment note, etc.
+  billId      String?
+  bill        Bill?        @relation(fields: [billId], references: [id])
+  notes       String?
+  createdAt   DateTime     @default(now())
+
+  @@index([customerId])
+  @@index([createdAt])
+}
+
+enum KhataType {
+  CREDIT   // Customer owes more (purchase on credit)
+  PAYMENT  // Customer paid back
+}
+
+// ─── Owner Preferences (persistent memory) ──────────────────────────
+
+model OwnerPreference {
+  id             String   @id @default(uuid())
+  telegramUserId String
+  key            String
+  value          String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([telegramUserId, key])
+  @@index([telegramUserId])
+}
+
+// ─── Conversation State ─────────────────────────────────────────────
+
+model ConversationState {
+  id             String   @id @default(uuid())
+  telegramUserId String   @unique
+  currentBillId  String?  // Active draft bill
+  lastActivity   DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+// ─── Daily Summary ──────────────────────────────────────────────────
+
+model DailySummary {
+  id             String   @id @default(uuid())
+  date           DateTime @db.Date @unique
+  telegramUserId String
+  totalSales     Int      @default(0) // in paise
+  totalTax       Int      @default(0) // in paise
+  totalCgst      Int      @default(0) // in paise
+  totalSgst      Int      @default(0) // in paise
+  cashSales      Int      @default(0) // in paise
+  upiSales       Int      @default(0) // in paise
+  cardSales      Int      @default(0) // in paise
+  creditSales    Int      @default(0) // in paise
+  billCount      Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([date])
+  @@index([telegramUserId])
+}
+
+// ─── Processed Telegram Updates (idempotency) ───────────────────────
+
+model ProcessedUpdate {
+  updateId   Int      @id
+  processedAt DateTime @default(now())
+}
+
+// ─── Bill Number Sequence ───────────────────────────────────────────
+
+model BillSequence {
+  id      String @id @default("singleton")
+  current Int    @default(0)
+}
